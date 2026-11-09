@@ -460,7 +460,7 @@ def running_check(tmp):
     before = account_sync.app_running()
     check(before is not None, f"the check works here (Claude running now: {before})")
     folder = os.path.join(tmp, "fake-apps")
-    argv0 = None
+    env = None
     if IS_WINDOWS:
         source = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "PING.EXE")
         app = os.path.join(folder, "AnthropicClaude", "claude.exe")
@@ -469,9 +469,9 @@ def running_check(tmp):
     elif IS_MAC:
         source, app, cli, args = "/bin/sleep", os.path.join(folder, "Claude"), None, ["30"]
     else:
-        # Newer Ubuntu ships uutils coreutils: one binary that picks the tool by the name it is started with. So
-        # the copy keeps "sleep" as its name (argv[0]) and still runs from the copied file, which the check sees.
-        source, args, argv0 = "/bin/sleep", ["30"], "sleep"
+        # A copy of this Python, sleeping: a copy of /bin/sleep doesn't stay up on newer Ubuntu (uutils coreutils)
+        source, args = sys.executable, ["-c", "import time; time.sleep(30)"]
+        env = dict(os.environ, PYTHONHOME=sys.base_prefix)
         app = os.path.join(folder, "claude-desktop", "claude-desktop")
         cli = os.path.join(folder, ".local", "share", "claude", "versions", "9.9.9", "claude")
 
@@ -492,22 +492,26 @@ def running_check(tmp):
         if not build_sleeper(path):
             shutil.copyfile(source, path)   # not copy2: macOS system files carry flags a copy can't keep
             os.chmod(path, 0o755)
-        p = subprocess.Popen([argv0 or path] + args, executable=path if argv0 else None,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = subprocess.Popen([path] + args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         time.sleep(1)
-        check(p.poll() is None, f"the stand-in process ({os.path.basename(path)}) is running")
+        rc = p.poll()
+        why = "" if rc is None else f" (it ended with {rc}: {p.stderr.read().decode('utf-8', 'replace').strip()[:200]})"
+        check(rc is None, f"the stand-in process ({os.path.basename(path)}) is running{why}")
         return p
+
+    def stop(p):
+        p.kill()
+        p.wait()
+        p.stderr.close()
 
     if cli:
         p = start(cli)
         if before is False:
             check(account_sync.app_running() is False, "a Claude Code CLI process is not taken for the app")
-        p.kill()
-        p.wait()
+        stop(p)
     p = start(app)
     check(account_sync.app_running() is True, "a process that looks like the app is seen")
-    p.kill()
-    p.wait()
+    stop(p)
     if before is False:
         time.sleep(0.5)
         check(account_sync.app_running() is False, "and when it ends, it is not")
