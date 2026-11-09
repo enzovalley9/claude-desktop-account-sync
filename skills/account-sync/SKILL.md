@@ -8,8 +8,9 @@ description: Keeps Claude Code Desktop sessions in sync across the Claude accoun
 One script does all the work and prints a few short lines. Run it and pass its output on. Do not read the app's
 files or the script itself: that is what keeps this cheap. Nothing is written until you run `apply`, `arm` or `undo`.
 
-Below, `SYNC` means `python3 "<base directory of this skill>/scripts/account_sync.py"`. The base directory is shown
-when this skill loads. Write the full command every time: shell variables do not survive between commands.
+Below, `SYNC` means `python3 "<base directory of this skill>/scripts/account_sync.py"` (on Windows, `python` or `py`
+instead of `python3`). The base directory is shown when this skill loads. Write the full command every time: shell
+variables do not survive between commands.
 
 ## First time
 
@@ -22,11 +23,13 @@ when this skill loads. Write the full command every time: shell variables do not
 
 1. `SYNC plan` is a dry run. Show the user its lines and ask for the go-ahead.
 2. On macOS run `SYNC arm`, then ask the user to quit Claude with Cmd+Q. The sync runs as soon as Claude is closed
-   and Claude reopens by itself. On other systems the user quits Claude and runs `SYNC apply` in a terminal.
+   and Claude reopens by itself. On Windows and Linux, `plan` ends with the exact command to run: give it to the
+   user, who quits Claude completely, runs it in a terminal and opens Claude again.
 3. Once Claude is back (this session or a new one), `SYNC status` shows how it went.
 
 Never ask the user to keep Claude open during a sync, and never try `apply` from inside Claude: you run inside
-Claude, so on the real data `apply` always refuses while you are running. That is what `arm` is for.
+Claude, so on the real data `apply` always refuses while you are running. That is what `arm` and the printed
+command are for.
 
 Switching accounts: sync, then sign in to the other account in the app as usual. The sync is two-way, so syncing
 again later, from either account, brings each account up to date.
@@ -44,8 +47,8 @@ account that is signed in now. After a sync that brought sessions in:
 
 ## Undo
 
-`SYNC undo --show` says what the last sync would be undone to. On macOS `SYNC arm --undo` plus Cmd+Q undoes it;
-elsewhere `SYNC undo` with Claude closed. Each undo goes back one sync.
+`SYNC undo --show` says what undoing the last sync would do, and how. On macOS `SYNC arm --undo` plus Cmd+Q undoes
+it; on Windows and Linux it prints the command to run with Claude closed. Each undo goes back one sync.
 
 ## When something goes wrong
 

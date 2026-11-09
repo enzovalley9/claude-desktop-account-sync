@@ -7,25 +7,33 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   scenarios:
+    name: ${{ matrix.os }}, Python 3.13
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            python: "3.9"
-          - os: ubuntu-latest
-            python: "3.13"
-          - os: macos-latest
-            python: "3.13"
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.13"
       - name: Scenarios on made-up data
         run: python -I tests/test_scenarios.py --tmp "$RUNNER_TEMP"
       - name: Script help
         run: python -I skills/account-sync/scripts/account_sync.py --help
+
+  oldest-python:
+    name: Linux, Python 3.9
+    runs-on: ubuntu-latest
+    container: python:3.9-slim
+    steps:
+      - uses: actions/checkout@v5
+      - name: Scenarios on made-up data
+        run: python -I tests/test_scenarios.py --tmp "$RUNNER_TEMP"

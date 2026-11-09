@@ -3,6 +3,6 @@
   "owner": { "name": "Enzo Valley", "url": "https://github.com/enzovalley9" },
   "metadata": { "description": "account-sync, a Claude Code skill that keeps Claude Code Desktop sessions in sync across your Claude accounts" },
   "plugins": [
-    { "name": "account-sync", "source": "./", "description": "Two-way, incremental sync of Claude Code Desktop sessions, routines and sidebar between the Claude accounts on one Mac" }
+    { "name": "account-sync", "source": "./", "description": "Two-way, incremental sync of Claude Code Desktop sessions, routines and sidebar between the Claude accounts on one computer" }
   ]
 }

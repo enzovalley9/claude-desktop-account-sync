@@ -2,7 +2,7 @@
   "name": "account-sync",
   "displayName": "account-sync",
   "version": "0.1.0",
-  "description": "Keep Claude Code Desktop sessions, routines and sidebar in sync across the Claude accounts on one Mac",
+  "description": "Keep Claude Code Desktop sessions, routines and sidebar in sync across the Claude accounts on one computer",
   "author": { "name": "Enzo Valley", "url": "https://github.com/enzovalley9" },
   "homepage": "https://github.com/enzovalley9/claude-desktop-account-sync",
   "repository": "https://github.com/enzovalley9/claude-desktop-account-sync",

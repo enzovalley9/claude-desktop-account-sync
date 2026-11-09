@@ -16,6 +16,7 @@ Commands (nothing is written to the app unless you use apply, arm or undo):
   sidebar              tool calls that make the signed-in account's sidebar match the other accounts
   undo                 undo the last sync (the Claude app must be closed); --show to preview
 
+The app's data folder is found by itself on macOS, Windows (also Microsoft Store installs) and Linux.
 Only the Python standard library is used (3.9 or newer).
 """
 import argparse
@@ -25,6 +26,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -36,8 +38,10 @@ from collections import Counter
 
 VERSION = "0.1.0"
 IS_MAC = sys.platform == "darwin"
-DEFAULT_APP_DIR = os.path.expanduser("~/Library/Application Support/Claude") if IS_MAC else None
+IS_WINDOWS = os.name == "nt"
+IS_LINUX = sys.platform.startswith("linux")
 DEFAULT_DATA_DIR = os.path.expanduser("~/.claude-account-sync")
+CLI_PATH_PARTS = ("\\.local\\bin\\", "\\node_modules\\", "\\winget\\")   # Windows installs of the Claude Code CLI
 APP_PATH = "/Applications/Claude.app"
 APP_BUNDLE_ID = "com.anthropic.claudefordesktop"
 APP_PROCESS = "Claude"
@@ -128,18 +132,29 @@ def create_file(path, data, mtime=None, mode=0o600):
         os.unlink(tmp)  # the final file is left with a single link
 
 
+def _replace(src, dst):
+    """os.replace, retried for a moment on Windows, where an antivirus or the indexer may hold a file."""
+    for attempt in range(5):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            if not IS_WINDOWS or attempt == 4:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+
+
 def replace_file(path, data, mtime=None):
     """Rewrite path atomically, keeping its permissions."""
     mode = stat.S_IMODE(os.lstat(path).st_mode)
     tmp = _tmp_file(os.path.dirname(path), data, mode, mtime)
-    os.replace(tmp, path)
+    _replace(tmp, path)
 
 
 def write_json(path, obj):
     """For account-sync's own files (state, results): write to a temp file, then rename."""
-    with open(path + ".tmp", "w") as f:
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=1)
-    os.replace(path + ".tmp", path)
+    _replace(path + ".tmp", path)
 
 
 def restore_copy(src, dst):
@@ -148,7 +163,7 @@ def restore_copy(src, dst):
     os.close(fd)
     try:
         shutil.copy2(src, tmp)
-        os.replace(tmp, dst)
+        _replace(tmp, dst)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -157,15 +172,112 @@ def restore_copy(src, dst):
 
 # ---------- the app ----------
 
-def app_running():
-    """True or False on macOS; None where we can't tell."""
-    if not IS_MAC:
+def candidate_app_dirs(system=None, env=None, home=None):
+    """Where the Claude app may keep its data on this kind of system."""
+    system = system or sys.platform
+    env = os.environ if env is None else env
+    home = home or os.path.expanduser("~")
+    if system == "darwin":
+        return [os.path.join(home, "Library", "Application Support", "Claude")]
+    if system.startswith("win"):
+        roaming = env.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        local = env.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        out = [os.path.join(roaming, "Claude"), os.path.join(local, "Claude")]
+        # Microsoft Store (MSIX) installs: Windows keeps what the app writes in the package's own folder
+        for pkg in sorted(glob.glob(os.path.join(local, "Packages", "Claude_*"))):
+            out += [os.path.join(pkg, "LocalCache", "Roaming", "Claude"), os.path.join(pkg, "LocalCache", "Local", "Claude")]
+        return out
+    return [os.path.join(env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "Claude")]
+
+
+def find_app_dir(system=None, env=None, home=None):
+    """(the folder in use, other folders found). In use = the one with the most recently changed session record."""
+    found = []
+    for d in candidate_app_dirs(system, env, home):
+        root = os.path.join(d, "claude-code-sessions")
+        if os.path.isdir(root):
+            records = glob.glob(os.path.join(root, "*", "*", "local_*.json"))
+            found.append((max((os.path.getmtime(p) for p in records), default=0), d))
+    if not found:
+        return None, []
+    found.sort(key=lambda x: x[0], reverse=True)   # stable: ties keep the order above
+    return found[0][1], [d for _, d in found[1:]]
+
+
+def _run(cmd, timeout=30):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
         return None
-    # -a: without it pgrep skips its own ancestors, so it can't see Claude when run from inside Claude
-    return subprocess.run(["/usr/bin/pgrep", "-a", "-x", APP_PROCESS], capture_output=True).returncode == 0
+
+
+def _windows_app_running():
+    # The app and the Claude Code CLI both run as claude.exe, so look at where each one runs from.
+    r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+              "foreach ($p in @(Get-Process -Name claude -ErrorAction SilentlyContinue)) "
+              "{ if ($p.Path) { $p.Path } else { '?' } }; exit 0"])
+    if r is None or r.returncode != 0:
+        return None
+    paths = [line.strip().lower() for line in r.stdout.splitlines() if line.strip()]
+    return any(not any(part in p for part in CLI_PATH_PARTS) for p in paths)
+
+
+def _linux_app_running():
+    # The app (package claude-desktop) runs as claude-desktop or from a folder of that name. The Claude Code
+    # CLI runs as claude from ~/.local/share/claude, so the bare name "claude" is not enough.
+    me, uid = os.getpid(), os.getuid()
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit() and int(d) != me]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv0 = f.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+        except OSError:
+            continue
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            exe = ""
+        for path in (exe, argv0):
+            if os.path.basename(path).startswith("claude-desktop") or "/claude-desktop/" in path or "/Claude/" in path:
+                return True
+    return False
+
+
+def app_running():
+    """True or False; None when it can't be told on this system."""
+    if IS_MAC:
+        # -a: without it pgrep skips its own ancestors, so it can't see Claude when run from inside Claude
+        r = _run(["/usr/bin/pgrep", "-a", "-x", APP_PROCESS])
+        return None if r is None else {0: True, 1: False}.get(r.returncode)
+    if IS_WINDOWS:
+        return _windows_app_running()
+    if IS_LINUX:
+        return _linux_app_running()
+    return None
+
+
+def quit_hint():
+    if IS_MAC:
+        return "quit it with Cmd+Q"
+    if IS_WINDOWS:
+        return "quit it completely (also from its icon by the clock, if it has one)"
+    return "quit it completely"
+
+
+def command_line(*args):
+    """This script with args, ready to paste into a terminal."""
+    parts = [sys.executable, os.path.abspath(__file__)] + [str(x) for x in args]
+    return subprocess.list2cmdline(parts) if IS_WINDOWS else " ".join(shlex.quote(p) for p in parts)
 
 
 def app_version():
+    if not IS_MAC:
+        return None
     try:
         with open(os.path.join(APP_PATH, "Contents", "Info.plist"), "rb") as f:
             return plistlib.load(f).get("CFBundleShortVersionString")
@@ -174,18 +286,33 @@ def app_version():
 
 
 def is_real_app_dir(app_dir):
-    return DEFAULT_APP_DIR is not None and os.path.realpath(app_dir) == os.path.realpath(DEFAULT_APP_DIR)
+    real = os.path.realpath(app_dir)
+    return any(real == os.path.realpath(d) for d in candidate_app_dirs())
 
 
 def signed_in_account(app_dir):
     return (read_json(os.path.join(app_dir, "config.json")) or {}).get("lastKnownAccountUuid")
 
 
+def short_path(p):
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if p.startswith(home + os.sep) else p
+
+
 def dirs(a):
-    app_dir = a.app_dir or DEFAULT_APP_DIR
+    app_dir = a.app_dir
     if not app_dir:
-        raise Fail("--app-dir is required on this system (there is only a default on macOS)")
+        app_dir, _ = find_app_dir()
+        if not app_dir:
+            raise Fail("couldn't find the Claude app's data folder (looked in "
+                       + ", ".join(short_path(d) for d in candidate_app_dirs()) + "). Pass it with --app-dir")
     return os.path.abspath(os.path.expanduser(app_dir)), os.path.abspath(os.path.expanduser(a.data_dir))
+
+
+def path_args(a, app_dir, data_dir):
+    """--app-dir / --data-dir as given, so a printed command works the same."""
+    return ((["--app-dir", app_dir] if a.app_dir else [])
+            + (["--data-dir", data_dir] if data_dir != os.path.abspath(DEFAULT_DATA_DIR) else []))
 
 
 # ---------- accounts ----------
@@ -682,8 +809,9 @@ def remember(base_c, key, present):
 
 
 def pid_alive(pid):
-    if os.name != "posix":
-        return True   # os.kill(pid, 0) is not a harmless check on Windows
+    if IS_WINDOWS:   # os.kill(pid, 0) is not a harmless check on Windows
+        r = _run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"])
+        return True if r is None else f'"{pid}"' in r.stdout
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -712,7 +840,7 @@ def take_lock(data_dir):
     raise Fail(f"could not take the lock {path}")
 
 
-def do_sync(app_dir, data_dir, only=None, details=False, apply=False):
+def do_sync(app_dir, data_dir, only=None, details=False, apply=False, apply_cmd=None):
     accounts = load_accounts(app_dir, data_dir)
     targets = [c for c in accounts if not only or c.name == only]
     if not targets:
@@ -720,7 +848,8 @@ def do_sync(app_dir, data_dir, only=None, details=False, apply=False):
     real = is_real_app_dir(app_dir)
     running = app_running()
     if apply and real and running:
-        raise Fail("Claude is running: quit it with Cmd+Q and run apply again, or use `arm`", code=3)
+        raise Fail(f"Claude is running: {quit_hint()} and run apply again" + (", or use `arm`" if IS_MAC else ""),
+                   code=3)
     lines = []
     if apply and running is None:
         lines.append("note: can't tell whether Claude is running on this system: make sure it is closed")
@@ -758,7 +887,7 @@ def do_sync(app_dir, data_dir, only=None, details=False, apply=False):
             parts = [f"{k}: {v}" for k, v in n.items() if v]
             written = c in targets
             lines.append(f"  {c.name} ({c.short}){'' if written else ' (not written)'}: "
-                         f"{', '.join(parts) if parts else 'nothing to change'} → {len(final[c.name])} sessions")
+                         f"{', '.join(parts) if parts else 'nothing to change'} -> {len(final[c.name])} sessions")
             summary.append({"name": c.name, "id": c.short, "written": written, "changes": dict(n),
                             "sessions_after": len(final[c.name])})
         for k, v in sorted(run.notes.items()):
@@ -771,8 +900,11 @@ def do_sync(app_dir, data_dir, only=None, details=False, apply=False):
                 "sidebar": plan}
         if not apply:
             if any(run.counts.values()):
-                lines.append("To write these changes: `arm` and quit Claude (or `apply` with Claude closed)." if IS_MAC
-                             else "To write these changes: quit Claude, then `apply`.")
+                if IS_MAC:
+                    lines.append("To write these changes: `arm` and quit Claude (or `apply` with Claude closed).")
+                else:
+                    lines += ["To write these changes, quit Claude completely and run this in a terminal:",
+                              "  " + (apply_cmd or command_line("apply"))]
             return 0, lines, data
 
         failures = verify(run, targets)
@@ -801,17 +933,15 @@ def do_sync(app_dir, data_dir, only=None, details=False, apply=False):
 
 # ---------- undo ----------
 
-def undo_impl(app_dir, data_dir, show=False):
+def undo_impl(app_dir, data_dir, show=False, undo_cmd=None):
     runs = [r for r in sorted(glob.glob(os.path.join(data_dir, "runs", "*")))
             if os.path.isfile(os.path.join(r, "manifest.json")) and not os.path.exists(os.path.join(r, "UNDONE"))]
     if not runs:
         return 1, ["Nothing to undo."], {}
     run_dir = runs[-1]
     man = read_json(os.path.join(run_dir, "manifest.json"))
-    root = man.get("app_dir") or "/"
-    paths = man["created"] + [m["path"] for m in man["modified"]]
-    real = DEFAULT_APP_DIR and any(
-        os.path.realpath(p).startswith(os.path.realpath(DEFAULT_APP_DIR) + os.sep) for p in paths)
+    root = man.get("app_dir") or app_dir
+    real = is_real_app_dir(root)
     previous = os.path.join(run_dir, "previous-state.json")
     state = os.path.join(data_dir, "state.json")
     undone = os.path.join(run_dir, "moved-aside")   # not "undone": macOS file names ignore case
@@ -822,9 +952,15 @@ def undo_impl(app_dir, data_dir, show=False):
              else "  state.json is moved aside (there was none before)"]
     data = {"run_dir": run_dir, "restored": len(man["modified"]), "moved_aside": len(man["created"])}
     if show:
+        if IS_MAC:
+            lines.append("To undo it: `arm --undo` and quit Claude (or `undo` with Claude closed).")
+        else:
+            lines += ["To undo it, quit Claude completely and run this in a terminal:",
+                      "  " + (undo_cmd or command_line("undo"))]
         return 0, lines, data
     if real and app_running():
-        raise Fail("Claude is running: quit it with Cmd+Q and run undo again, or use `arm --undo`", code=3)
+        raise Fail(f"Claude is running: {quit_hint()} and run undo again" + (", or use `arm --undo`" if IS_MAC else ""),
+                   code=3)
     lock = take_lock(data_dir)
     try:
         for m in man["modified"]:
@@ -844,7 +980,7 @@ def undo_impl(app_dir, data_dir, show=False):
         elif os.path.exists(state):
             os.makedirs(undone, exist_ok=True)
             shutil.move(state, os.path.join(undone, "state.json"))
-        with open(os.path.join(run_dir, "UNDONE"), "w") as f:
+        with open(os.path.join(run_dir, "UNDONE"), "w", encoding="utf-8") as f:
             f.write(now_str() + "\n")
     finally:
         if os.path.exists(lock):
@@ -862,7 +998,12 @@ def cmd_accounts(a):
     cfg = read_json(os.path.join(data_dir, "accounts.json")) or {}
     selected = {(x["account"], x["org"]): x["name"] for x in cfg.get("accounts", [])}
     ver = app_version() if is_real_app_dir(app_dir) else None
-    lines = ["Claude accounts on this computer" + (f" (Claude {ver})" if ver else "") + ":"]
+    lines = [f"Claude accounts in {short_path(app_dir)}" + (f" (Claude {ver})" if ver else "") + ":"]
+    if not a.app_dir:
+        _, others = find_app_dir()
+        if others:
+            lines.append("  note: older Claude data also in " + ", ".join(short_path(d) for d in others)
+                         + "; --app-dir picks another folder")
     hidden, rows = 0, []
     in_use = {f["account"] for f in found if f["sessions"]}
     for f in found:
@@ -874,7 +1015,8 @@ def cmd_accounts(a):
         tags = (["signed in"] if f["account"] == me else []) + \
                ([f'selected as "{selected[key]}"'] if key in selected else [])
         last = dt.datetime.fromtimestamp(f["last"]).strftime("%Y-%m-%d %H:%M") if f["last"] else "-"
-        lines.append(f'  {f["account"][:8]}/{f["org"][:8]}  {f["sessions"]:>5} sessions  last change {last}'
+        lines.append(f'  {f["account"][:8]}/{f["org"][:8]}  {f["sessions"]:>5} session{"s" if f["sessions"] != 1 else " "}'
+                     f'  last change {last}'
                      + (f"  [{', '.join(tags)}]" if tags else ""))
         rows.append({"id": f["account"][:8] + "/" + f["org"][:8], "account": f["account"], "org": f["org"],
                      "sessions": f["sessions"], "signed_in": f["account"] == me, "selected_as": selected.get(key)})
@@ -910,7 +1052,8 @@ def cmd_select(a):
 
 def cmd_plan(a):
     app_dir, data_dir = dirs(a)
-    return do_sync(app_dir, data_dir, a.only, a.details, apply=False)
+    apply_cmd = command_line("apply", *(["--only", a.only] if a.only else []), *path_args(a, app_dir, data_dir))
+    return do_sync(app_dir, data_dir, a.only, a.details, apply=False, apply_cmd=apply_cmd)
 
 
 def cmd_apply(a):
@@ -920,7 +1063,7 @@ def cmd_apply(a):
 
 def cmd_undo(a):
     app_dir, data_dir = dirs(a)
-    return undo_impl(app_dir, data_dir, show=a.show)
+    return undo_impl(app_dir, data_dir, show=a.show, undo_cmd=command_line("undo", *path_args(a, app_dir, data_dir)))
 
 
 def cmd_sidebar(a):
@@ -945,7 +1088,14 @@ def launchd_domain():
 
 def cmd_arm(a):
     if not IS_MAC:
-        raise Fail("arm needs macOS (launchd). Elsewhere: quit Claude and run `apply`")
+        what = ["undo"] if a.undo else ["apply"] + (["--only", a.only] if a.only else [])
+        try:
+            app_dir, data_dir = dirs(a)
+            extra = path_args(a, app_dir, data_dir)
+        except Fail:
+            extra = []
+        raise Fail("arm needs macOS. Here, quit Claude completely and run this in a terminal:\n  "
+                   + command_line(*what, *extra))
     app_dir, data_dir = dirs(a)
     if not a.undo:
         load_accounts(app_dir, data_dir)   # fail now, not after you quit Claude
@@ -1015,13 +1165,13 @@ def cmd_status(a):
         lines.append("last sync: none yet")
     log = os.path.join(data_dir, "sync.log")
     if os.path.exists(log):
-        with open(log, errors="replace") as f:
+        with open(log, encoding="utf-8", errors="replace") as f:
             text = f.read().splitlines()
         heads = [i for i, l in enumerate(text) if l.startswith("=== ")]
         if heads:
             block = text[heads[-1]:]
             result = next((l for l in reversed(block) if l.startswith("RESULT: ")), None)
-            lines.append(f"last armed run: {block[0][4:]} → "
+            lines.append(f"last armed run: {block[0][4:]} -> "
                          + (result[8:] if result else "no result yet (still waiting, or it was interrupted)"))
             data["last_armed"] = {"header": block[0][4:], "result": result[8:] if result else None}
     return 0, lines, data
@@ -1122,6 +1272,11 @@ COMMANDS = {"accounts": cmd_accounts, "select": cmd_select, "plan": cmd_plan, "a
 
 
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):   # session titles can be any text; Windows pipes default to cp1252
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     p = build_parser()
     a = p.parse_args(argv)
     if not a.cmd:

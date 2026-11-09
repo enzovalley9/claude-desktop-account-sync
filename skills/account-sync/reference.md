@@ -2,7 +2,16 @@
 
 ## Where Claude Code Desktop keeps things
 
-On macOS, under `~/Library/Application Support/Claude/`:
+The app's data folder:
+
+| System | Folder |
+| --- | --- |
+| macOS | `~/Library/Application Support/Claude/` |
+| Windows | `%APPDATA%\Claude\` or `%LOCALAPPDATA%\Claude\`; Microsoft Store installs keep it in `%LOCALAPPDATA%\Packages\Claude_…\LocalCache\` |
+| Linux | `~/.config/Claude/` (or `$XDG_CONFIG_HOME/Claude/`) |
+
+If more than one exists, account-sync uses the one with the most recently changed session record; `accounts` names the
+others and `--app-dir` picks one. Inside it:
 
 | Path | What it is | account-sync |
 | --- | --- | --- |
@@ -42,7 +51,8 @@ records, plus routines, backlog and archive, are all that account-sync copies.
 
 ## Safety
 
-- Writes only while Claude is closed. On macOS `apply` checks it and `arm` waits for it.
+- Writes only while Claude is closed. `apply` and `undo` check it: on macOS the `Claude` process, on Windows any
+  `claude.exe` that isn't a Claude Code CLI install, on Linux `claude-desktop`. On macOS `arm` waits for it.
 - Dry run first. `apply` refuses to write anything if a file doesn't look as expected (`unexpected format`).
 - Files are written atomically (a temporary file, then a rename), with permissions 600 and never as links: the app
   refuses symbolic links in its data folder.
@@ -76,6 +86,8 @@ In `~/.claude-account-sync/` (change it with `--data-dir`):
 
 - **Armed, but nothing happens.** Claude or one of its helper processes is still running. Quit with Cmd+Q, not by
   closing the window. The armed job gives up after two hours; `disarm` cancels it.
+- **"Claude is running" on Windows with Claude closed.** It may still be in the notification area by the clock: quit
+  it from there. A Claude Code CLI session installed somewhere unusual can also look like the app; close it.
 - **An account is missing from `accounts`.** Sign in with it once in the app so that the app creates its folder.
   Empty folders of accounts that have sessions in another folder are hidden; `accounts --all` shows them.
 - **The other account's sidebar looks different.** Run `sidebar` while signed in to it.

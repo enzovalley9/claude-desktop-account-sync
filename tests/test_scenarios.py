@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Tests for account-sync. They never touch the Claude app's data: everything happens inside --tmp.
 
-  python3 tests/test_scenarios.py --tmp DIR              scenarios on made-up data (any OS)
-  python3 tests/test_scenarios.py --tmp DIR --real-copy  macOS: also on a COPY of this computer's Claude data:
+  python3 tests/test_scenarios.py --tmp DIR              scenarios on made-up data (macOS, Windows, Linux)
+  python3 tests/test_scenarios.py --tmp DIR --real-copy  also on a COPY of this computer's Claude data:
                                                          apply, apply again (nothing may change), then undo both
                                                          (the copy must end up identical to the original)
   python3 tests/test_scenarios.py --tmp DIR --launchd    macOS: also `arm --test` through launchd (a dry run)
@@ -21,9 +21,12 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(os.path.dirname(HERE), "skills", "account-sync", "scripts")
 SCRIPT = os.path.join(SCRIPTS, "account_sync.py")
+sys.path.insert(0, SCRIPTS)
+import account_sync  # noqa: E402  (the script itself, for its platform helpers)
+
 PY = sys.executable
 IS_MAC = sys.platform == "darwin"
-REAL_APP = os.path.expanduser("~/Library/Application Support/Claude")
+IS_WINDOWS = os.name == "nt"
 T0 = 1_790_000_000_000                  # ms, for lastActivityAt
 M0 = int(time.time()) - 30 * 86400      # s, for file dates
 FAILURES = []
@@ -50,7 +53,7 @@ def show(text):
 
 
 def run_script(*args):
-    r = subprocess.run([PY, "-I", SCRIPT, *args], capture_output=True, text=True)
+    r = subprocess.run([PY, "-I", SCRIPT, *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
     return r.returncode, r.stdout + r.stderr
 
 
@@ -78,7 +81,7 @@ def cli_id(n):
 
 def write(p, obj, mtime=None, indent=None):
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "w") as f:
+    with open(p, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=indent, separators=None if indent else (",", ":"))
     os.chmod(p, 0o600)
     if mtime is not None:
@@ -86,7 +89,7 @@ def write(p, obj, mtime=None, indent=None):
 
 
 def load(p):
-    with open(p) as f:
+    with open(p, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -184,7 +187,7 @@ def scenarios(tmp):
     check("(1 empty folder hidden" in out and out.count("cccccccc/") == 2,
           "hides only the empty folder of an account that has sessions in another one")
     rc, out = E.run("accounts", "--all")
-    check(rc == 0 and out.count(" sessions  last change") == 5, "--all shows every folder")
+    check(rc == 0 and out.count("last change") == 5, "--all shows every folder")
     rc, out = E.run("plan")
     check(rc == 2 and "no accounts selected yet" in out, "plan before select says what to do")
     rc, out = E.run("plan", "--json")
@@ -221,8 +224,9 @@ def scenarios(tmp):
           "the copy doesn't carry the other account's error notices")
     check("error" in E.rec(A, 2), "the original keeps its notice")
     check(int(os.stat(os.path.join(B, sid(1) + ".json")).st_mtime) == M0 + 10, "the copy keeps the original's date")
-    check(all(os.stat(os.path.join(B, sid(n) + ".json")).st_mode & 0o777 == 0o600 for n in (1, 2, 3)),
-          "the copies have permissions 600")
+    if os.name == "posix":
+        check(all(os.stat(os.path.join(B, sid(n) + ".json")).st_mode & 0o777 == 0o600 for n in (1, 2, 3)),
+              "the copies have permissions 600")
     check(all(os.stat(os.path.join(B, sid(n) + ".json")).st_nlink == 1 for n in (1, 2, 3)),
           "the copies are plain files, not links")
     check(E.archived(B) == [sid(7)], "archive index created with the archived session")
@@ -362,20 +366,19 @@ def scenarios(tmp):
           "and writes nothing")
     os.rename(bad, os.path.join(E.trash, os.path.basename(bad)))
 
-    if os.name == "posix":
-        print("\n8. One run at a time")
-        lock = os.path.join(E.data, ".lock")
-        with open(lock, "w") as f:
-            f.write(str(os.getpid()))
-        rc, out = E.run("apply")
-        check(rc == 2 and "in progress" in out and E.rec(A, 12) is None, "a live lock stops a second run")
-        p = subprocess.Popen([PY, "-c", "pass"])
-        p.wait()
-        with open(lock, "w") as f:
-            f.write(str(p.pid))
-        rc, out = E.run("apply")
-        check(rc == 0 and E.rec(A, 12) is not None and not os.path.exists(lock),
-              "a lock left by a run that is gone is cleared")
+    print("\n8. One run at a time")
+    lock = os.path.join(E.data, ".lock")
+    with open(lock, "w") as f:
+        f.write(str(os.getpid()))
+    rc, out = E.run("apply")
+    check(rc == 2 and "in progress" in out and E.rec(A, 12) is None, "a live lock stops a second run")
+    p = subprocess.Popen([PY, "-c", "pass"])
+    p.wait()
+    with open(lock, "w") as f:
+        f.write(str(p.pid))
+    rc, out = E.run("apply")
+    check(rc == 0 and E.rec(A, 12) is not None and not os.path.exists(lock),
+          "a lock left by a run that is gone is cleared")
 
     print("\n9. Status")
     rc, out = E.run("status")
@@ -404,12 +407,89 @@ def scenarios(tmp):
 
     if not IS_MAC:
         rc, out = E.run("arm")
-        check(rc == 2 and "macOS" in out, "arm explains that it needs macOS")
+        check(rc == 2 and "needs macOS" in out and "apply" in out, "arm says what to run instead")
+        rc, out = E.run("plan")
+        check("run this in a terminal" in out or "nothing to change" in out, "plan gives the command to run")
     return E
 
 
+def finding_the_app(tmp):
+    print("\n11. Finding the app's data folder on each system")
+    home = os.path.join(tmp, "homes")
+
+    def records(d, mtime):
+        p = os.path.join(d, "claude-code-sessions", ACC_A, ORG_A, sid(1) + ".json")
+        write(p, {"sessionId": sid(1)}, mtime)
+
+    mac = os.path.join(home, "mac")
+    records(os.path.join(mac, "Library", "Application Support", "Claude"), M0)
+    found, others = account_sync.find_app_dir("darwin", {}, mac)
+    check(found == os.path.join(mac, "Library", "Application Support", "Claude") and others == [], "macOS")
+
+    win = os.path.join(home, "win")
+    roaming, local = os.path.join(win, "AppData", "Roaming"), os.path.join(win, "AppData", "Local")
+    env = {"APPDATA": roaming, "LOCALAPPDATA": local}
+    records(os.path.join(roaming, "Claude"), M0)
+    found, others = account_sync.find_app_dir("win32", env, win)
+    check(found == os.path.join(roaming, "Claude"), "Windows: %APPDATA%\\Claude")
+    store = os.path.join(local, "Packages", "Claude_abc123", "LocalCache", "Roaming", "Claude")
+    records(store, M0 + 100)
+    found, others = account_sync.find_app_dir("win32", env, win)
+    check(found == store and others == [os.path.join(roaming, "Claude")],
+          "Windows: a Microsoft Store install wins when its sessions are newer, and the other folder is reported")
+
+    lin = os.path.join(home, "linux")
+    records(os.path.join(lin, ".config", "Claude"), M0)
+    found, _ = account_sync.find_app_dir("linux", {}, lin)
+    check(found == os.path.join(lin, ".config", "Claude"), "Linux: ~/.config/Claude")
+    records(os.path.join(lin, "xdg", "Claude"), M0)
+    found, _ = account_sync.find_app_dir("linux", {"XDG_CONFIG_HOME": os.path.join(lin, "xdg")}, lin)
+    check(found == os.path.join(lin, "xdg", "Claude"), "Linux: $XDG_CONFIG_HOME/Claude")
+    check(account_sync.find_app_dir("linux", {}, os.path.join(home, "empty")) == (None, []), "nothing found: None")
+
+
+def running_check(tmp):
+    print("\n12. Telling whether Claude is running on this system")
+    before = account_sync.app_running()
+    check(before is not None, f"the check works here (Claude running now: {before})")
+    folder = os.path.join(tmp, "fake-apps")
+    if IS_WINDOWS:
+        source = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "PING.EXE")
+        app = os.path.join(folder, "AnthropicClaude", "claude.exe")
+        cli = os.path.join(folder, ".local", "bin", "claude.exe")
+        args = ["-n", "30", "127.0.0.1"]
+    elif IS_MAC:
+        source, app, cli, args = "/bin/sleep", os.path.join(folder, "Claude"), None, ["30"]
+    else:
+        source, args = "/bin/sleep", ["30"]
+        app = os.path.join(folder, "claude-desktop", "claude-desktop")
+        cli = os.path.join(folder, ".local", "share", "claude", "versions", "9.9.9", "claude")
+
+    def start(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        shutil.copyfile(source, path)   # not copy2: macOS system files carry flags a copy can't keep
+        os.chmod(path, 0o755)
+        p = subprocess.Popen([path] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        return p
+
+    if cli:
+        p = start(cli)
+        if before is False:
+            check(account_sync.app_running() is False, "a Claude Code CLI process is not taken for the app")
+        p.kill()
+        p.wait()
+    p = start(app)
+    check(account_sync.app_running() is True, "a process that looks like the app is seen")
+    p.kill()
+    p.wait()
+    if before is False:
+        time.sleep(0.5)
+        check(account_sync.app_running() is False, "and when it ends, it is not")
+
+
 def launchd(E):
-    print("\n11. arm --test through launchd (a dry run)")
+    print("\n13. arm --test through launchd (a dry run)")
     log = os.path.join(E.data, "sync.log")
     rc, out = E.run("arm", "--test")
     check(rc == 0, "arm --test is accepted by launchd")
@@ -433,11 +513,12 @@ def launchd(E):
 
 
 def real_copy(tmp):
-    print("\n12. A copy of this computer's real data (apply, apply again, undo both)")
-    root = os.path.join(REAL_APP, "claude-code-sessions")
-    if not IS_MAC or not os.path.isdir(root):
+    print("\n14. A copy of this computer's real data (apply, apply again, undo both)")
+    real_app, _ = account_sync.find_app_dir()
+    if not real_app:
         print("  skip  no Claude data on this computer")
         return
+    root = os.path.join(real_app, "claude-code-sessions")
     picked = [(acc, org) for acc in sorted(os.listdir(root)) if os.path.isdir(os.path.join(root, acc))
               for org in sorted(os.listdir(os.path.join(root, acc)))
               if glob.glob(os.path.join(root, acc, org, "local_*.json"))]
@@ -448,10 +529,10 @@ def real_copy(tmp):
     app, data = os.path.join(base, "app"), os.path.join(base, "data")
     for acc, org in picked:
         rel = os.path.join("claude-code-sessions", acc, org)
-        shutil.copytree(os.path.join(REAL_APP, rel), os.path.join(app, rel), symlinks=True)
+        shutil.copytree(os.path.join(real_app, rel), os.path.join(app, rel), symlinks=True)
     for f in ("claude_desktop_config.json", "config.json"):
-        if os.path.exists(os.path.join(REAL_APP, f)):
-            shutil.copy2(os.path.join(REAL_APP, f), os.path.join(app, f))
+        if os.path.exists(os.path.join(real_app, f)):
+            shutil.copy2(os.path.join(real_app, f), os.path.join(app, f))
 
     def go(*args):
         return run_script(*args, "--app-dir", app, "--data-dir", data)
@@ -472,8 +553,6 @@ def real_copy(tmp):
     rc1, _ = go("undo")
     rc2, _ = go("undo")
     check(rc1 == 0 and rc2 == 0 and fingerprint(app) == h0, "undoing both leaves the copy identical to the original")
-    sys.path.insert(0, SCRIPTS)
-    import account_sync
     running = account_sync.app_running()
     print(f"  info  Claude running now, according to account_sync: {'yes' if running else 'no'} "
           "(with the real folder and Claude running, apply refuses)")
@@ -482,20 +561,22 @@ def real_copy(tmp):
 def main():
     ap = argparse.ArgumentParser(description="account-sync tests (never touch the real Claude data)")
     ap.add_argument("--tmp", required=True, help="working folder for the tests")
-    ap.add_argument("--real-copy", action="store_true", help="macOS: also test on a copy of this computer's data")
+    ap.add_argument("--real-copy", action="store_true", help="also test on a copy of this computer's data")
     ap.add_argument("--launchd", action="store_true", help="macOS: also run `arm --test` through launchd")
     a = ap.parse_args()
     tmp = os.path.join(os.path.abspath(a.tmp), "account-sync-test-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
-    if os.path.realpath(tmp).startswith(os.path.realpath(REAL_APP) + os.sep):
+    if any(os.path.realpath(tmp).startswith(os.path.realpath(d) + os.sep) for d in account_sync.candidate_app_dirs()):
         sys.exit("--tmp can't be inside the Claude app's data folder")
     os.makedirs(tmp)
     print("Test folder:", tmp)
     E = scenarios(tmp)
+    finding_the_app(tmp)
+    running_check(tmp)
     if a.launchd:
         if IS_MAC:
             launchd(E)
         else:
-            print("\n11. skip  --launchd needs macOS")
+            print("\n13. skip  --launchd needs macOS")
     if a.real_copy:
         real_copy(tmp)
     print(f"\n{'ALL OK' if not FAILURES else f'{len(FAILURES)} FAILED'}")
