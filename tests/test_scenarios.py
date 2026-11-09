@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -277,8 +278,14 @@ def scenarios(tmp):
     check(r1a["lastRunAt"] == "2026-11-01T08:00:00.000Z", "last run: the latest one (so it doesn't run twice)")
     check(r1a.get("missedRunScanFloor") == "2026-11-05T00:00:00.000Z", "scan floor: the latest one")
     check("r2" not in E.routine_list(B) and "r2" in E.routine_list(A), "the routine deleted in the new one doesn't come back")
-    with open(os.path.join(B, "scheduled-tasks.json")) as f:
-        check(f.read().startswith("{\n"), "scheduled-tasks.json stays indented, the way the app writes it")
+    with open(os.path.join(B, "scheduled-tasks.json"), "rb") as f:
+        check(f.read().startswith(b"{\n"), "scheduled-tasks.json stays indented, the way the app writes it")
+    with tempfile.TemporaryDirectory() as d:
+        crlf = os.path.join(d, "scheduled-tasks.json")
+        with open(crlf, "wb") as f:
+            f.write(b'{\r\n  "scheduledTasks": []\r\n}\r\n')
+        check(account_sync.same_format(crlf, {"scheduledTasks": []}).startswith(b"{\n"),
+              "a file with Windows line ends counts as indented too")
     check(E.rec(B, 6).get("isArchived") is True and sid(6) in E.archived(B),
           "archived in the old one: archived in the new one and listed in its index")
     check(E.backlog(B) == ["k2", "k3"], "backlog: k3 arrives and k1 (deleted in the new one) doesn't come back")
@@ -453,6 +460,7 @@ def running_check(tmp):
     before = account_sync.app_running()
     check(before is not None, f"the check works here (Claude running now: {before})")
     folder = os.path.join(tmp, "fake-apps")
+    argv0 = None
     if IS_WINDOWS:
         source = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "PING.EXE")
         app = os.path.join(folder, "AnthropicClaude", "claude.exe")
@@ -461,16 +469,33 @@ def running_check(tmp):
     elif IS_MAC:
         source, app, cli, args = "/bin/sleep", os.path.join(folder, "Claude"), None, ["30"]
     else:
-        source, args = "/bin/sleep", ["30"]
+        # Newer Ubuntu ships uutils coreutils: one binary that picks the tool by the name it is started with. So
+        # the copy keeps "sleep" as its name (argv[0]) and still runs from the copied file, which the check sees.
+        source, args, argv0 = "/bin/sleep", ["30"], "sleep"
         app = os.path.join(folder, "claude-desktop", "claude-desktop")
         cli = os.path.join(folder, ".local", "share", "claude", "versions", "9.9.9", "claude")
 
+    def build_sleeper(path):
+        # Newer macOS kills copies of its own system binaries, so on a Mac with a compiler build a tiny sleeper
+        if not IS_MAC or not shutil.which("cc"):
+            return False
+        if subprocess.run(["xcode-select", "-p"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            return False   # without the developer tools, cc only offers to install them
+        src = os.path.join(folder, "sleeper.c")
+        with open(src, "w") as f:
+            f.write("#include <unistd.h>\nint main(void) { sleep(30); return 0; }\n")
+        return subprocess.run(["cc", "-o", path, src], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0
+
     def start(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        shutil.copyfile(source, path)   # not copy2: macOS system files carry flags a copy can't keep
-        os.chmod(path, 0o755)
-        p = subprocess.Popen([path] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not build_sleeper(path):
+            shutil.copyfile(source, path)   # not copy2: macOS system files carry flags a copy can't keep
+            os.chmod(path, 0o755)
+        p = subprocess.Popen([argv0 or path] + args, executable=path if argv0 else None,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1)
+        check(p.poll() is None, f"the stand-in process ({os.path.basename(path)}) is running")
         return p
 
     if cli:

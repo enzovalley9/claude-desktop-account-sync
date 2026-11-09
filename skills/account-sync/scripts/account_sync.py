@@ -89,9 +89,11 @@ def indented(obj):
 def same_format(path, obj):
     """Serialize obj like the file it replaces (the app writes some files indented, some compact)."""
     try:
-        return indented(obj) if read_bytes(path)[:2] == b"{\n" else compact(obj)
+        head = read_bytes(path)[:3]
     except FileNotFoundError:
         return compact(obj)
+    # \r\n too: a file saved by a Windows editor is still the indented kind
+    return indented(obj) if head.startswith((b"{\n", b"{\r\n")) else compact(obj)
 
 
 def to_ms(value):
